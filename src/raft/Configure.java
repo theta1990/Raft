@@ -7,7 +7,7 @@ import java.util.ArrayList;
 public class Configure {
 
 	private ArrayList<String> serverNames;
-	
+	private ArrayList<Integer> serverList;
 	private int serverNum;
 
 	
@@ -29,7 +29,6 @@ public class Configure {
 	public void initConfig(String path){
 		
 		configPath = path;
-		
 	}
 	
 	public static Configure getConfig() throws Exception{
@@ -40,10 +39,17 @@ public class Configure {
 	}
 	
 	public final ArrayList<String> getServerNames(){
+		
 		return serverNames;
 	}
 	
+	public final ArrayList<Integer> getServerList(){
+		
+		return serverList;
+	}
+	
 	public final int getServerNum(){
+		
 		return serverNum;
 	}
 }

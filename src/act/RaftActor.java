@@ -3,15 +3,15 @@ package act;
 import java.util.ArrayList;
 import java.util.Timer;
 import java.util.TimerTask;
-import java.util.concurrent.Callable;
 
 import mes.ElectionMessage;
+import mes.HeartBeatCheckMessage;
+import mes.HeartBeatMessage;
 import mes.RaftMessage;
+import mes.RaftVoteReplyMessage;
 import mes.RaftVoteRequestMessage;
 import raft.Configure;
 import raft.State;
-import akka.actor.ActorPath;
-import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 import akka.actor.Props;
 import akka.actor.UntypedActor;
@@ -19,46 +19,40 @@ import akka.japi.Creator;
 
 public class RaftActor extends UntypedActor {
 
-	private final String m_name;
+	private final int m_id;
 
 	private int m_curTerm;
-	private String m_voteFor;
+	private int m_voteFor;
 	private State m_state;
+
+	private int m_votesNum;
 
 	private long followerTimeOut = 300;
 	private long candidateTimeOut = 500;
 	private long heartbeatCycle = 100;
 
-	private Timer m_followerTimer = null;
-	private Timer m_candidateTimer = null;
-	private Timer m_leaderTimer = null;
+	private Timer m_Timer = null;
 
-	public RaftActor(final String name) {
+
+	public RaftActor(final int id) {
 		super();
 
-		this.m_name = name;
+		this.m_id = id;
 		this.m_curTerm = 0;
-		this.m_voteFor = null;
-		this.m_state = State.follower;
-
-		m_followerTimer = new Timer();
-		m_followerTimer.schedule(new TimerTask() {
-
-			@Override
-			public void run() {
-
-				/**
-				 * follower time out, run election phase now
-				 */
-				getSelf().tell(new ElectionMessage(1, m_curTerm), getSelf());
-			}
-		}, followerTimeOut);
-
+		this.m_voteFor = -1;
+		this.m_Timer = new Timer();
+		
+		changeToFollower();
 	}
 
-	public final String getName() {
+	public final int getid() {
 
-		return m_name;
+		return m_id;
+	}
+
+	public int getCurTime() {
+
+		return m_curTerm;
 	}
 
 	@Override
@@ -66,140 +60,221 @@ public class RaftActor extends UntypedActor {
 
 		if (!(message instanceof RaftMessage))
 			unhandled(message);
-
-		if (message instanceof ElectionMessage) {	//begin election
-			runElection();
-		}else if( message instanceof RaftVoteRequestMessage ) {	//receive vote request 
-			handleVote(((RaftVoteRequestMessage) message).getCurTime(), ((RaftVoteRequestMessage) message).getVoteFor());
+		else {
+			if (((RaftMessage) message).getCurTime() < getCurTime()) {
+				// we are more advanced, we do not listen to what the message.
+				// ignore it
+				return;
+			}
 		}
 
+		if (message instanceof ElectionMessage) {
+			// begin election
+			if( m_state != State.leader)
+				handleElection();
+		} else if (message instanceof RaftVoteRequestMessage) {
+			// receive vote request
+			handleVoteRequest(((RaftVoteRequestMessage) message).getCurTime(),
+					((RaftVoteRequestMessage) message).getVoteFor());
+		} else if (message instanceof RaftVoteReplyMessage) {
+			// receive reply for vote request
+			handleVoteReply(((RaftVoteReplyMessage) message).getCurTime(),
+					((RaftVoteReplyMessage) message).getVote());
+		} else if (message instanceof HeartBeatCheckMessage) {
+			// try to send heart beat message
+			handleHeartBeatCheck();
+		} else if( message instanceof HeartBeatMessage ){
+			handleHeartBeat();
+		}
 	}
 
-	public void runElection() {
+	/**
+	 * A heartbeat message with leader time out. The actor choose to enter into
+	 * a new era, And try to elect itself as the leader Follower to candidates
+	 */
+	private void handleElection() {
 
 		m_curTerm++;
-		m_voteFor = m_name;
-
+		m_voteFor = m_id;
+		m_votesNum = 1;
+		m_state = State.candidate;
 		try {
-			final ArrayList<String> serverNames = Configure.getConfig()
-					.getServerNames();
+			final ArrayList<Integer> serverIds = Configure.getConfig()
+					.getServerList();
 
-			for (String server : serverNames) {
-				if (server.equals(m_name))
+			for (Integer server : serverIds) {
+				if (server == m_id)
 					continue;
-				getContext().actorSelection("/user/" + m_name).tell(
-						new RaftVoteRequestMessage(1, m_curTerm, m_name), getSelf());
-				
+				getContext().actorSelection("/user/" + server.toString()).tell(
+						new RaftVoteRequestMessage(1, m_curTerm, server),
+						getSelf());
+
 			}
 
 		} catch (Exception e) {
 			e.printStackTrace();
 		}
-
+		changeToCandidate();
 	}
 
 	/**
-	 * 处理投票
+	 * 处理投票请求
+	 * 
 	 * @param term
 	 * @param voteName
 	 * @return
 	 */
-	public boolean handleVote(int term, String voteName){
+	private boolean handleVoteRequest(int term, int voteName) {
+
 		boolean ret = false;
-		
-		if( m_curTerm < term ) {
-			
+
+		if (m_curTerm < term) {
 			ret = false;
-		}else if( m_curTerm == term && (m_voteFor == null || m_voteFor.equals(voteName))){
-			
+		} else if (m_curTerm == term
+				&& (m_voteFor == -1 || m_voteFor == voteName)) {
 			m_voteFor = voteName;
 			ret = true;
 			changeToFollower();
-		}else {
-			
+		} else {
 			m_voteFor = voteName;
 			m_curTerm = term;
-			ret=  true;
+			ret = true;
 			changeToFollower();
 		}
-		
 		return ret;
 	}
-	
-	public void heartbeat() {
 
-		// restart the follower timer;
+	/**
+	 * 接受投票，增加自己获得的选票
+	 * 
+	 * @param term
+	 * @param vote
+	 */
+	private void handleVoteReply(int term, boolean vote) {
 
+		if (vote) {
+			++m_votesNum;
+
+			try {
+				if (m_votesNum > Configure.getConfig().getServerNum() / 2) {
+
+					changeToLeader();
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
 	}
 
-	private void changeToFollower() {
+	private void handleHeartBeatCheck() {
 
-		m_state = State.follower;
-		m_followerTimer.schedule(new TimerTask() {
+		try {
+			final ArrayList<Integer> serverList = Configure.getConfig()
+					.getServerList();
 
+			for (Integer server : serverList) {
+				if (server == m_id)
+					continue;
+				getContext().actorSelection("/user/" + server.toString()).tell(
+						new HeartBeatMessage(1, m_curTerm), getSelf());
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+	}
+
+	private void handleHeartBeat(){
+		
+		m_Timer.cancel();
+
+		ElectionTask task = new ElectionTask(m_curTerm, followerTimeOut) {
 			@Override
 			public void run() {
 
-				// synchronized (syncflag) {
-				changeToCandidate();
-				// }
+				getSelf().tell(new ElectionMessage(1, this.m_curTerm),
+						getSelf());
 			}
-		}, elapseTimeOut);
+		};
+		m_Timer.schedule(task, task.m_timeOut);
+	}
+	
+	/**
+	 * Now work as a follower DONE
+	 */
+	private void changeToFollower() {
+
+		m_state = State.follower;
+
+		// use the term when teh task built, instead of which when the task run.
+		ElectionTask task = new ElectionTask(m_curTerm, followerTimeOut) {
+			@Override
+			public void run() {
+
+				getSelf().tell(new ElectionMessage(1, this.m_curTerm),
+						getSelf());
+			}
+		};
+		m_Timer.schedule(task, task.m_timeOut);
 	}
 
+	/**
+	 * Now work as a candidate DONE
+	 */
 	private void changeToCandidate() {
 
 		m_state = State.candidate;
 
-		if (m_followerTimer != null) {
-			m_followerTimer.cancel();
-			m_followerTimer = null;
-		}
-		election();
-
-		m_candidateTimer = new Timer();
-		m_candidateTimer.schedule(new TimerTask() {
+		m_Timer.cancel();
+		
+		ElectionTask task = new ElectionTask(m_curTerm, candidateTimeOut) {
 
 			@Override
 			public void run() {
 
-				// synchronized (syncflag) {
-				election();
-				// }
+				getSelf().tell(new ElectionMessage(1, this.m_curTerm),
+						getSelf());
 			}
-		}, electionTimeOut);
+		};
 
+		m_Timer.schedule(task, task.m_timeOut);
 	}
 
 	private void changeToLeader() {
 
 		m_state = State.leader;
 
-		m_leaderTimer = new Timer();
-		m_leaderTimer.schedule(new TimerTask() {
+		m_Timer.cancel();
+		
+		HeartBeatTask task = new HeartBeatTask(m_curTerm) {
 
 			@Override
 			public void run() {
 
-				// synchronized (syncflag) {
-				heartbeat();
-				// }
+				// send heart beat message to all nodes;
+				getSelf().tell(new HeartBeatCheckMessage(1, getTime()),
+						getSelf());
 			}
-		}, 0, heartbeatCycle);
+		};
+		/**
+		 * heartbeat 可以有两种方式来做，一种是另外一个线程，周期性的发送heartbeat消息，
+		 * 另外一种方法是另外一个线程将heartbeat的请求周期性的加入到acotr的事件队列中 ，由Actor来负责发送heartbeat请求。
+		 * 现在我们先采用第二种方案
+		 */
+		m_Timer.schedule(task, 0, heartbeatCycle);
 	}
 
 	static class RaftCreator implements Creator<RaftActor> {
 
 		private static final long serialVersionUID = 1L;
-		private final String m_actorName;
+		private final int m_id;
 
-		public RaftCreator(final String actorName) {
-			this.m_actorName = actorName;
+		public RaftCreator(final int id) {
+			this.m_id = id;
 		}
 
 		@Override
 		public RaftActor create() throws Exception {
-			return new RaftActor(m_actorName);
+			return new RaftActor(m_id);
 		}
 	}
 
@@ -207,8 +282,7 @@ public class RaftActor extends UntypedActor {
 
 		ActorSystem system = ActorSystem.create("System");
 		for (int i = 0; i < 5; ++i) {
-			system.actorOf(Props.create(new RaftCreator(new Integer(i)
-					.toString())));
+			system.actorOf(Props.create(new RaftCreator(i)));
 		}
 	}
 
